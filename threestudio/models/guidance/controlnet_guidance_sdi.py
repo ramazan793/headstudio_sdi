@@ -1,12 +1,13 @@
 import os
 from dataclasses import dataclass
 
+import random
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from controlnet_aux import CannyDetector, NormalBaeDetector
-from diffusers import ControlNetModel, DDIMScheduler, StableDiffusionControlNetPipeline
+from diffusers import ControlNetModel, DDIMScheduler, StableDiffusionControlNetPipeline, DDIMInverseScheduler
 from diffusers.utils.import_utils import is_xformers_available
 from tqdm import tqdm
 
@@ -14,10 +15,11 @@ import threestudio
 from threestudio.models.prompt_processors.base import PromptProcessorOutput
 from threestudio.utils.base import BaseObject
 from threestudio.utils.misc import C, parse_version
+from threestudio.utils.ops import perpendicular_component
 from threestudio.utils.typing import *
 
 
-@threestudio.register("controlnet-depth-guidance")
+@threestudio.register("controlnet-depth-guidance-sdi")
 class ControlNetGuidance(BaseObject):
     @dataclass
     class Config(BaseObject.Config):
@@ -49,6 +51,16 @@ class ControlNetGuidance(BaseObject):
         # Canny threshold
         canny_lower_bound: int = 50
         canny_upper_bound: int = 100
+        
+        # sdi related:
+        enable_sdi: bool = True
+        inversion_guidance_scale: float = -7.5
+        inversion_n_steps: int = 10
+        inversion_eta: float = 0.3
+        t_anneal: bool = True
+        # n_ddim_steps: int = 50 # same as diffusion steps
+        trainer_max_steps: int = 10000
+        view_dependent_prompting: bool = True
 
     cfg: Config
 
@@ -104,13 +116,6 @@ class ControlNetGuidance(BaseObject):
         self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
             self.cfg.pretrained_model_name_or_path, controlnet=controlnet, **pipe_kwargs
         ).to(self.device)
-        self.scheduler = DDIMScheduler.from_pretrained(
-            self.cfg.ddim_scheduler_name_or_path,
-            subfolder="scheduler",
-            torch_dtype=self.weights_dtype,
-            cache_dir=self.cfg.cache_dir,
-        )
-        self.scheduler.set_timesteps(self.cfg.diffusion_steps)
 
         if self.cfg.enable_memory_efficient_attention:
             if parse_version(torch.__version__) >= parse_version("2"):
@@ -150,6 +155,23 @@ class ControlNetGuidance(BaseObject):
             p.requires_grad_(False)
         for p in self.unet.parameters():
             p.requires_grad_(False)
+
+        self.scheduler = DDIMScheduler.from_pretrained(
+            self.cfg.ddim_scheduler_name_or_path,
+            subfolder="scheduler",
+            torch_dtype=self.weights_dtype,
+            cache_dir=self.cfg.cache_dir,
+        )
+        self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device=self.device)
+        self.scheduler.set_timesteps(self.cfg.diffusion_steps, device=self.device)
+        
+        self.inverse_scheduler = DDIMInverseScheduler.from_pretrained(
+            self.cfg.ddim_scheduler_name_or_path,
+            subfolder="scheduler",
+            torch_dtype=self.weights_dtype,
+        )
+        self.inverse_scheduler.set_timesteps(self.cfg.inversion_n_steps, device=self.device)
+        self.inverse_scheduler.alphas_cumprod = self.inverse_scheduler.alphas_cumprod.to(device=self.device)
 
         self.num_train_timesteps = self.scheduler.config.num_train_timesteps
         self.set_min_max_steps()  # set to default value
@@ -200,7 +222,6 @@ class ControlNetGuidance(BaseObject):
             mid_block_additional_residual,
     ) -> Float[Tensor, "..."]:
         input_dtype = latents.dtype
-        # print('unet t.shape: ', t.shape)
         return self.unet(
             latents.to(self.weights_dtype),
             t.to(self.weights_dtype),
@@ -247,6 +268,277 @@ class ControlNetGuidance(BaseObject):
         image = self.vae.decode(latents.to(self.weights_dtype)).sample
         image = (image * 0.5 + 0.5).clamp(0, 1)
         return image.to(input_dtype)
+    @torch.cuda.amp.autocast(enabled=False)
+    @torch.no_grad()
+    def predict_noise(
+        self,
+        latents_noisy: Float[Tensor, "B 4 64 64"],
+        t: Int[Tensor, "B"],
+        prompt_utils: PromptProcessorOutput,
+        elevation: Float[Tensor, "B"],
+        azimuth: Float[Tensor, "B"],
+        camera_distances: Float[Tensor, "B"],
+        guidance_scale: float = 1.0,
+        text_embeddings: Optional[Float[Tensor, "..."]] = None,
+        image_cond = None
+    ):
+        
+        batch_size = elevation.shape[0]
+
+        if prompt_utils.use_perp_neg:
+            (
+                text_embeddings,
+                neg_guidance_weights,
+            ) = prompt_utils.get_text_embeddings_perp_neg(
+                elevation, azimuth, camera_distances, self.cfg.view_dependent_prompting
+            )
+        
+
+            with torch.no_grad():
+                latent_model_input = torch.cat([latents_noisy] * 4)
+                image_cond_input = torch.cat([image_cond] * 4)
+                down_block_res_samples, mid_block_res_sample = self.forward_controlnet(
+                    latent_model_input,
+                    torch.cat([t] * 4),
+                    encoder_hidden_states=text_embeddings,
+                    image_cond=image_cond_input,
+                    condition_scale=self.cfg.condition_scale,
+                )
+
+                noise_pred = self.forward_control_unet(
+                    latent_model_input,
+                    torch.cat([t] * 4),
+                    encoder_hidden_states=text_embeddings,
+                    cross_attention_kwargs=None,
+                    down_block_additional_residuals=down_block_res_samples,
+                    mid_block_additional_residual=mid_block_res_sample,
+                )
+
+            noise_pred_text = noise_pred[:batch_size]
+            noise_pred_uncond = noise_pred[batch_size : batch_size * 2]
+            noise_pred_neg = noise_pred[batch_size * 2 :]
+
+            # print('noise_pred_text.shape', noise_pred_text.shape)
+            # print('noise_pred_uncond.shape', noise_pred_uncond.shape)
+            # print('noise_pred_neg.shape', noise_pred_neg.shape)
+
+            e_pos = noise_pred_text - noise_pred_uncond
+            accum_grad = 0
+            n_negative_prompts = neg_guidance_weights.shape[-1]
+            for i in range(n_negative_prompts):
+                e_i_neg = noise_pred_neg[i::n_negative_prompts] - noise_pred_uncond
+                accum_grad += neg_guidance_weights[:, i].view(
+                    -1, 1, 1, 1
+                ).to(e_i_neg.device) * perpendicular_component(e_i_neg, e_pos)
+
+            noise_pred = noise_pred_uncond + guidance_scale * (
+                e_pos + accum_grad
+            )
+        else:
+            neg_guidance_weights = None
+            
+            if text_embeddings is None:
+                text_embeddings = prompt_utils.get_text_embeddings(
+                    elevation, azimuth, camera_distances, self.cfg.view_dependent_prompting
+                )
+            
+            # predict the noise residual with unet, NO grad!
+            with torch.no_grad():
+                # pred noise
+                latent_model_input = torch.cat([latents_noisy] * 3)
+                image_cond_input = torch.cat([image_cond] * 3)
+
+                _t = torch.cat([t] * 3)
+                # print(_t.shape, latent_model_input.shape, image_cond_input.shape)
+                down_block_res_samples, mid_block_res_sample = self.forward_controlnet(
+                    latent_model_input,
+                    _t,
+                    encoder_hidden_states=text_embeddings,
+                    image_cond=image_cond_input,
+                    condition_scale=self.cfg.condition_scale,
+                )
+
+                noise_pred = self.forward_control_unet(
+                    latent_model_input,
+                    _t,
+                    encoder_hidden_states=text_embeddings,
+                    cross_attention_kwargs=None,
+                    down_block_additional_residuals=down_block_res_samples,
+                    mid_block_additional_residual=mid_block_res_sample,
+                )
+
+            # BUG?
+            # noise_pred_text, noise_pred_uncond, noise_pred_null = noise_pred.chunk(3)
+            # noise_pred = noise_pred_text + guidance_scale * (
+            #     noise_pred_text - noise_pred_uncond
+            # )
+            noise_pred_text, _, noise_pred_null = noise_pred.chunk(3)
+            noise_pred = noise_pred_null + guidance_scale * (
+                noise_pred_text - noise_pred_null
+            )
+        
+        return noise_pred, neg_guidance_weights, text_embeddings
+
+    def ddim_inversion_step(
+        self,
+        model_output: torch.FloatTensor,
+        timestep: int,
+        prev_timestep: int,
+        sample: torch.FloatTensor
+    ) -> torch.FloatTensor:
+        # 1. compute alphas, betas
+        # change original implementation to exactly match noise levels for analogous forward process
+        alpha_prod_t = self.inverse_scheduler.alphas_cumprod[timestep] if timestep >= 0 else self.inverse_scheduler.initial_alpha_cumprod
+        alpha_prod_t_prev = self.inverse_scheduler.alphas_cumprod[prev_timestep]
+
+        beta_prod_t = 1 - alpha_prod_t
+
+        # 2. compute predicted original sample from predicted noise also called
+        # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        if self.inverse_scheduler.config.prediction_type == "epsilon":
+            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            pred_epsilon = model_output
+        elif self.inverse_scheduler.config.prediction_type == "sample":
+            pred_original_sample = model_output
+            pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+        elif self.inverse_scheduler.config.prediction_type == "v_prediction":
+            pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
+            pred_epsilon = (alpha_prod_t**0.5) * model_output + (beta_prod_t**0.5) * sample
+        else:
+            raise ValueError(
+                f"prediction_type given as {self.inverse_scheduler.config.prediction_type} must be one of `epsilon`, `sample`, or"
+                " `v_prediction`"
+            )
+        # 3. Clip or threshold "predicted x_0"
+        if self.inverse_scheduler.config.clip_sample:
+            pred_original_sample = pred_original_sample.clamp(
+                -self.inverse_scheduler.config.clip_sample_range, self.inverse_scheduler.config.clip_sample_range
+            )
+        # 4. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        pred_sample_direction = (1 - alpha_prod_t_prev) ** (0.5) * pred_epsilon
+
+        # 5. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+        
+        # 6. Add noise to the sample
+        variance = self.scheduler._get_variance(prev_timestep, timestep) ** (0.5)
+        prev_sample += self.cfg.inversion_eta * torch.randn_like(prev_sample) * variance
+        
+        return prev_sample
+    
+    def get_inversion_timesteps(self, invert_to_t, B):
+        n_training_steps = self.inverse_scheduler.config.num_train_timesteps
+        effective_n_inversion_steps = self.cfg.inversion_n_steps #int((n_training_steps / invert_to_t) * self.cfg.inversion_n_steps)
+
+        if self.inverse_scheduler.config.timestep_spacing == "leading":
+            step_ratio = n_training_steps // effective_n_inversion_steps
+            timesteps = (np.arange(0, effective_n_inversion_steps) * step_ratio).round().copy().astype(np.int64)
+            timesteps += self.inverse_scheduler.config.steps_offset
+        elif self.inverse_scheduler.config.timestep_spacing == "trailing":
+            step_ratio = n_training_steps / effective_n_inversion_steps
+            timesteps = np.round(np.arange(n_training_steps, 0, -step_ratio)[::-1]).astype(np.int64)
+            timesteps -= 1
+        else:
+            raise ValueError(
+                f"{self.config.timestep_spacing} is not supported. Please make sure to choose one of 'leading' or 'trailing'."
+            )
+        # use only timesteps before invert_to_t
+        timesteps = timesteps[timesteps < int(invert_to_t)]
+        
+        # Roll timesteps array by one to reflect reversed origin and destination semantics for each step
+        timesteps = np.concatenate([[int(timesteps[0] - step_ratio)], timesteps])
+        timesteps = torch.from_numpy(timesteps).to(self.device)
+        
+        # Add the last step
+        delta_t = int(random.random() * self.inverse_scheduler.config.num_train_timesteps // self.cfg.inversion_n_steps)
+        last_t = torch.tensor(
+                    min(  #timesteps[-1] + self.inverse_scheduler.config.num_train_timesteps // self.inverse_scheduler.num_inference_steps,
+                        invert_to_t + delta_t,
+                        self.inverse_scheduler.config.num_train_timesteps - 1
+                    )
+                , device=self.device)
+        timesteps = torch.cat([timesteps, last_t.repeat([B])])
+        return timesteps
+    
+    @torch.no_grad()
+    def invert_noise(self, start_latents, invert_to_t, prompt_utils, elevation, azimuth, camera_distances, image_cond):
+        latents = start_latents.clone()
+        B = start_latents.shape[0]
+        
+        timesteps = self.get_inversion_timesteps(invert_to_t, B)
+        for t, next_t in zip(timesteps[:-1], timesteps[1:]):
+            noise_pred, _, _ =  self.predict_noise(latents, t.repeat([B]), prompt_utils, elevation, azimuth, camera_distances,
+                                                    guidance_scale=self.cfg.inversion_guidance_scale, image_cond=image_cond)
+            latents = self.ddim_inversion_step(noise_pred, t, next_t, latents)
+
+        # remap the noise from t+delta_t to t
+        found_noise = self.get_noise_from_target(start_latents, latents, next_t)
+
+        return latents, found_noise
+    
+    def get_noise_from_target(self, target, cur_xt, t):
+        alpha_prod_t = self.scheduler.alphas_cumprod[t]
+        beta_prod_t = 1 - alpha_prod_t
+        noise = (cur_xt - target * alpha_prod_t ** (0.5)) / (beta_prod_t ** (0.5))
+        return noise
+    
+    def get_x0(self, original_samples, noise_pred, t):
+        step_results = self.scheduler.step(noise_pred, t[0], original_samples, return_dict=True)
+        if "pred_original_sample" in step_results:
+            return step_results["pred_original_sample"]
+        elif "denoised" in step_results:
+            return step_results["denoised"]
+        raise ValueError("Looks like the scheduler does not compute x0")
+    
+    @torch.no_grad()
+    def compute_grad_sdi(
+        self,
+        latents: Float[Tensor, "B 4 64 64"],
+        t: Int[Tensor, "B"],
+        prompt_utils: PromptProcessorOutput,
+        elevation: Float[Tensor, "B"],
+        azimuth: Float[Tensor, "B"],
+        camera_distances: Float[Tensor, "B"],
+        image_cond,
+        call_with_defined_noise: Optional[Float[Tensor, "B 4 64 64"]] = None,
+    ):
+        if call_with_defined_noise is not None:
+            noise = call_with_defined_noise.clone()
+            latents_noisy = self.scheduler.add_noise(latents, noise, t)
+        elif self.cfg.enable_sdi:
+            latents_noisy, noise = self.invert_noise(latents, t[0], prompt_utils, elevation, azimuth, camera_distances, image_cond)
+        else:
+            noise = torch.randn_like(latents)
+            latents_noisy = self.scheduler.add_noise(latents, noise, t)
+        
+        noise_pred, neg_guidance_weights, text_embeddings = self.predict_noise(
+            latents_noisy,
+            t,
+            prompt_utils,
+            elevation,
+            azimuth,
+            camera_distances,
+            image_cond=image_cond,
+            guidance_scale=self.cfg.guidance_scale
+        )
+
+        latents_denoised = self.get_x0(latents_noisy, noise_pred, t).detach() # (latents_noisy - sigma * noise_pred) / alpha
+
+        guidance_eval_utils = {
+            "use_perp_neg": prompt_utils.use_perp_neg,
+            "neg_guidance_weights": neg_guidance_weights,
+            "t_orig": t,
+            "latents_noisy": latents_noisy,
+            "noise_pred": noise_pred,
+            "elevation": elevation,
+            "azimuth": azimuth,
+            "camera_distances": camera_distances,
+        }
+
+        return latents_denoised, latents_noisy, noise, guidance_eval_utils
+
+
+
 
     def edit_latents(
             self,
@@ -398,6 +690,7 @@ class ControlNetGuidance(BaseObject):
             azimuth: Float[Tensor, "B"],
             camera_distances: Float[Tensor, "B"],
             rgb_as_latents=False,
+            call_with_defined_noise=None,
             **kwargs,
     ):
         batch_size = rgb.shape[0]
@@ -444,14 +737,28 @@ class ControlNetGuidance(BaseObject):
 
         if self.cfg.use_nfsd or self.cfg.use_dsd:
             grad = self.compute_grad_nfsd(text_embeddings, latents, image_cond, t)
+            target = (latents - grad).detach()
+        elif self.cfg.enable_sdi:
+            target, noisy_img, noise, guidance_eval_utils = self.compute_grad_sdi(
+                latents,
+                t,
+                prompt_utils,
+                elevation,
+                azimuth,
+                camera_distances,
+                image_cond,
+                call_with_defined_noise=call_with_defined_noise,
+            )
+            grad = latents - target
         else:
             grad = self.compute_grad_sds(text_embeddings, latents, image_cond, t)
+            target = (latents - grad).detach()
+
 
         grad = torch.nan_to_num(grad)
         if self.grad_clip_val is not None:
             grad = grad.clamp(-self.grad_clip_val, self.grad_clip_val)
-        target = (latents - grad).detach()
-        loss_sds = 0.5 * F.mse_loss(latents, target, reduction="sum") / batch_size
+        loss_sds = 0.5 * F.mse_loss(latents, target.detach(), reduction="sum") / batch_size
         return {
             "loss_sds": loss_sds,
             "grad_norm": grad.norm(),
@@ -466,10 +773,26 @@ class ControlNetGuidance(BaseObject):
         if self.cfg.grad_clip is not None:
             self.grad_clip_val = C(self.cfg.grad_clip, epoch, global_step)
 
-        self.set_min_max_steps(
-            min_step_percent=C(self.cfg.min_step_percent, epoch, global_step),
-            max_step_percent=C(self.cfg.max_step_percent, epoch, global_step),
-        )
+        if self.cfg.t_anneal:
+            percentage = (
+                float(global_step) / self.cfg.trainer_max_steps
+            )  # progress percentage
+            if type(self.cfg.max_step_percent) not in [float, int]:
+                max_step_percent = self.cfg.max_step_percent[1]
+            else:
+                max_step_percent = self.cfg.max_step_percent
+            curr_percent = (
+                max_step_percent - C(self.cfg.min_step_percent, epoch, global_step)
+            ) * (1 - percentage) + C(self.cfg.min_step_percent, epoch, global_step)
+            self.set_min_max_steps(
+                min_step_percent=curr_percent,
+                max_step_percent=curr_percent,
+            )
+        else:
+            self.set_min_max_steps(
+                min_step_percent=C(self.cfg.min_step_percent, epoch, global_step),
+                max_step_percent=C(self.cfg.max_step_percent, epoch, global_step),
+            )
 
 
 if __name__ == "__main__":
